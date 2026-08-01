@@ -1,0 +1,11 @@
+.DS_Store
+.vscode/
+*.app/
+*.dmg
+*.log
+*.zip
+backups/
+bin/
+dist/
+wedding-invitation-prototype/
+docs/research/cognee-local-model-options.md
