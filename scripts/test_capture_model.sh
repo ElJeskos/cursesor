@@ -23,12 +23,15 @@ for required_import in \
   fi
 done
 
-for forbidden_motion_import in \
+# These imports belong exclusively to the protected button path. The callback
+# regression test separately verifies that all motion/drag fields pass unchanged.
+for required_button_import in \
   _CGEventCreateCopy \
   _CGEventSetType \
+  _CGEventTapPostEvent \
   _CGEventPostToPid; do
-  if rg -q "^${forbidden_motion_import}$" <<<"$undefined_symbols"; then
-    echo "Protected camera motion must remain on the original global event route: $forbidden_motion_import" >&2
+  if ! rg -q "^${required_button_import}$" <<<"$undefined_symbols"; then
+    echo "A protected-button delivery import is missing: $required_button_import" >&2
     exit 1
   fi
 done
@@ -54,4 +57,4 @@ if rg -q '[[:space:]]_capture_boundary_repark_tick$' <<<"$local_symbols"; then
   exit 1
 fi
 
-echo 'PASS: the binary preserves physical camera motion and uses the reference-derived cursor ownership model.'
+echo 'PASS: capture ownership is preserved, with downstream tap routing for protected foreground buttons.'

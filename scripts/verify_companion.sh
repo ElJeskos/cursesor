@@ -9,7 +9,7 @@ LABEL="local.game-cursor-fence"
 LAUNCH_AGENT="$USER_HOME_DIR/Library/LaunchAgents/$LABEL.plist"
 SESSION_DOMAIN="gui/$(id -u)"
 EXPECTED_BUNDLE_ID="com.sviridov.gamehub-cursor-helper"
-EXPECTED_VERSION="1.2.15"
+EXPECTED_VERSION="1.2.17"
 
 count_companion_processes() {
   local process_ids

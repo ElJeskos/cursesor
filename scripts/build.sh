@@ -26,6 +26,7 @@ clang -std=c11 -Wall -Wextra -Werror -O2 \
 "$ROOT_DIR/scripts/test_provider_detection.sh" "$BUILD_BIN"
 "$ROOT_DIR/scripts/test_capture_edge_policy.sh"
 "$ROOT_DIR/scripts/test_capture_watchdog_policy.sh"
+"$ROOT_DIR/scripts/test_capture_button_delivery.sh"
 "$ROOT_DIR/scripts/test_capture_model.sh" "$BUILD_BIN"
 
 mv -f "$BUILD_BIN" "$BIN"

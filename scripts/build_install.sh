@@ -117,7 +117,9 @@ if ! pgrep -f "$APP_PROCESS_PATTERN" >/dev/null; then
 fi
 
 "$ROOT_DIR/scripts/test_top_click_no_teleport.sh"
-"$ROOT_DIR/scripts/test_capture_watchdog.sh"
+# The historical live watchdog probe assumes coordinate rewrites that capture
+# mode deliberately no longer performs. Use the current deterministic policy test.
+"$ROOT_DIR/scripts/test_capture_watchdog_policy.sh"
 if [[ "$RUN_WINE_E2E" == 'true' ]]; then
   "$ROOT_DIR/scripts/test_wine_top_motion.sh"
   "$ROOT_DIR/scripts/test_wine_slow_top_motion.sh"

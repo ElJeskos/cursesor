@@ -1,4 +1,10 @@
-# Game Cursor Fence: accepted RDR2 camera fix
+# Game Cursor Fence: accepted RDR2 camera fix and button update
+
+## Current button routing: 1.2.17 build 20
+
+Installed on 2026-10-04 after the user reported failed upper clicks in Little Nightmares III. Safe foreground button copies now use `CGEventTapPostEvent` with the live callback proxy, not PID-only posting. A CrossOver receiving-side probe without Win32 mouse capture ignores PID copies but receives exactly one WM/RAW down/up through the new route at Y=37, without physical pointer displacement. Camera/motion handling remains unchanged. After focus loss and during cleanup, releases retain best-effort PID targeting to avoid injecting into another foreground app; receipt there is not guaranteed. Actual Little Nightmares III gameplay acceptance is pending.
+
+Details and backup: [protected-click-routing-1.2.17.md](docs/research/protected-click-routing-1.2.17.md). The 1.2.16 sections below describe the previous iteration, not the current foreground route.
 
 ## Fixed behavior
 
@@ -18,9 +24,11 @@ The helper preserves the original event type, absolute location, `kCGMouseEventD
 It does not post a second PID-targeted copy, convert the event to a dragged type, rewrite the boundary coordinate, inject diagonal movement, or perform a live boundary warp.
 Therefore a physical event with `dx=0` remains strictly vertical and reaches Wine without helper-generated horizontal motion or a synthetic downward correction.
 
-At the protected top strip, the helper suppresses only mouse-button down and up events.
-Normal motion events in the same strip continue through unchanged.
-This prevents a top-edge click from exposing the macOS cursor without interfering with upward camera movement.
+In the original accepted `1.2.15` implementation, the helper suppressed mouse-button down and up events in the protected top strip without forwarding them. On 2026-10-03 the user explicitly requested retaining that system-side protection while making the game receive the click.
+
+The local `1.2.16` (build `19`) update still deletes the unsafe original but sends a tagged button-only copy to the verified frontmost game PID. X is preserved and Y is set to `top_fence_y() + 1.0` (default `37`, outside the `36.5` protected boundary). A redirected press retains its target PID and anchor until release, even if the physical release is outside the strip or focus changes. Capture disable/exit synthesizes a balancing up if needed and avoids a second game up when the physical release later arrives. No live physical cursor warp or motion replay is added.
+
+Normal motion and drag events in the same strip continue through unchanged. The synthetic activation-park filter applies only to motion, never to actual button events. The camera capture and watchdog algorithms are otherwise unchanged; the button update still requires gameplay validation.
 
 The visibility watchdog samples the real WindowServer cursor state from the main loop rather than mixing it with incoming HID coordinates.
 If Wine exposes the cursor, the watchdog hides it again and restores detached capture only once for that visibility breach.
@@ -30,14 +38,21 @@ When the matching game stops being active, the helper shows the cursor again, re
 
 ## Source locations
 
-- `src/game-cursor-fence.c` implements activation capture, one-time safe parking, unchanged motion pass-through, synthetic park suppression, protected top-button suppression, and cleanup.
+- `src/game-cursor-fence.c` implements activation capture, one-time safe parking, unchanged motion pass-through, synthetic park suppression, protected original-button suppression with separate safe PID delivery, and paired-button cleanup.
 - `src/capture_edge_policy.c` decides whether a button event belongs to the protected top strip.
 - `src/capture_watchdog_policy.c` implements the visibility-recovery latch.
-- `tests/capture_edge_policy_test.c` verifies top-strip button suppression.
+- `tests/capture_edge_policy_test.c` verifies which original button coordinates are protected.
+- `tests/capture_button_delivery_test.c` exercises the Quartz callback for safe exact-once button delivery and unchanged motion, without sending system input.
 - `tests/capture_watchdog_policy_test.c` verifies one recovery per visibility breach and the stable-hidden reset.
 
-## Accepted installed state
+## Historical accepted state (before the button update)
 
 The accepted runtime is Game Cursor Fence version `1.2.15`, build `18`.
 Its installed executable SHA-256 is `a4429715ced2e90b9bbe867656283294158c54100197651f7a1e3da9e87613ad`.
 The user confirmed in RDR2 on 2026-08-01 that the camera behavior is correct and requested that this implementation be left unchanged.
+
+## Installed button update
+
+After the user explicitly approved safe button delivery and closed the game/CrossOver session, version `1.2.16`, build `19`, was installed on 2026-10-03. The installed executable SHA-256 is `2c2a5112dfa8404dcedf8e00ff86f466c8598a6e75919733275c4a8aeba7b693`; its CodeDirectory hash is `bc9a079a8482e10477a4e978c446b758b53d3e92`. The signed `1.2.15` backup is preserved in `~/Library/Application Support/codex-game-cursor-fence/app-backups/Game Cursor Fence-20261003T123513Z-49488.app`.
+
+The new LaunchAgent runtime is signed, runs as one process, and installs the HID capture filter successfully. Callback regression and build checks pass. Gameplay validation of safe clicks and unchanged camera feel is still pending; it has not been confirmed by the user yet.

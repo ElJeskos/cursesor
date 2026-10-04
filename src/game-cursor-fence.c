@@ -27,6 +27,8 @@
 
 #define MAX_NEEDLES 32
 #define LINE_SIZE 32768
+#define CAPTURE_BUTTON_TAG INT64_C(0x474346434c49434b)
+#define MAX_CAPTURE_BUTTONS 32
 
 typedef enum {
     MODE_CAPTURE = 0,
@@ -96,11 +98,21 @@ static CGPoint g_last_capture_park_target = {0};
 static bool g_pending_capture_park_suppression = false;
 static GCFCaptureWatchdogState g_capture_watchdog_state = {0};
 
+typedef struct {
+    pid_t target_pid;
+    CGPoint location;
+    CGEventRef down_event;
+    bool cleanup_release_pending;
+} CapturedButton;
+
+static CapturedButton g_captured_buttons[MAX_CAPTURE_BUTTONS] = {0};
+
 typedef bool (*CursorIsVisibleFunction)(void);
 static CursorIsVisibleFunction g_cursor_is_visible = NULL;
 static bool g_cursor_visibility_lookup_finished = false;
 
 static const char *mode_name(CursorMode mode);
+static void release_captured_buttons(void);
 
 static void handle_signal(int signum) {
     (void)signum;
@@ -638,6 +650,9 @@ static void recenter_cursor_if_needed(CGPoint location) {
 }
 
 static void set_event_tap_enabled(bool enabled) {
+    if (!enabled) {
+        release_captured_buttons();
+    }
     if (!g_event_tap || g_event_tap_enabled == enabled) {
         return;
     }
@@ -729,11 +744,113 @@ static void capture_watchdog_tick(CGPoint location) {
     }
 }
 
+static bool is_capture_button_release(CGEventType type) {
+    return type == kCGEventLeftMouseUp || type == kCGEventRightMouseUp || type == kCGEventOtherMouseUp;
+}
+
+static CapturedButton *capture_button_state(CGEventType type, CGEventRef event) {
+    int64_t button;
+    if (type == kCGEventLeftMouseDown || type == kCGEventLeftMouseUp) {
+        button = 0;
+    } else if (type == kCGEventRightMouseDown || type == kCGEventRightMouseUp) {
+        button = 1;
+    } else if (type == kCGEventOtherMouseDown || type == kCGEventOtherMouseUp) {
+        button = CGEventGetIntegerValueField(event, kCGMouseEventButtonNumber);
+    } else {
+        return NULL;
+    }
+    return button >= 0 && button < MAX_CAPTURE_BUTTONS ? &g_captured_buttons[button] : NULL;
+}
+
+static void release_captured_button(CapturedButton *state) {
+    if (!state->down_event) {
+        return;
+    }
+    CGEventType down_type = CGEventGetType(state->down_event);
+    CGEventType up_type = down_type == kCGEventLeftMouseDown ? kCGEventLeftMouseUp :
+        (down_type == kCGEventRightMouseDown ? kCGEventRightMouseUp : kCGEventOtherMouseUp);
+    /* Reuse the retained button copy so cleanup cannot fail on allocation. */
+    CGEventSetType(state->down_event, up_type);
+    CGEventSetDoubleValueField(state->down_event, kCGMouseEventPressure, 0.0);
+    CGEventSetTimestamp(state->down_event, (CGEventTimestamp)(monotonic_seconds() * 1000000000.0));
+    CGEventPostToPid(state->target_pid, state->down_event);
+    atomic_fetch_add(&g_capture_forward_count, 1);
+    debug_log("capture-top-click-cleanup-up targetPid=%d type=%u", state->target_pid, (unsigned)up_type);
+    CFRelease(state->down_event);
+    *state = (CapturedButton){.target_pid = state->target_pid, .cleanup_release_pending = true};
+}
+
+static void release_captured_buttons(void) {
+    for (size_t i = 0; i < MAX_CAPTURE_BUTTONS; i++) {
+        release_captured_button(&g_captured_buttons[i]);
+    }
+}
+
+/* Safe foreground copies must continue through WindowServer hit-testing.
+ * PID-only posting bypasses that route and Wine can ignore the click when
+ * its window has not captured the mouse. Tap posting does not warp the cursor.
+ * Original motion remains untouched. */
+static bool forward_capture_button_to_game(CGEventTapProxy proxy, CGEventRef event, CGEventType type, CGPoint location) {
+    CapturedButton *state = capture_button_state(type, event);
+    bool paired_release = is_capture_button_release(type) && state && state->down_event;
+    pid_t target_pid;
+    CGPoint safe_location;
+    if (paired_release) {
+        target_pid = state->target_pid;
+        safe_location = state->location;
+    } else {
+        target_pid = atomic_load(&g_capture_target_pid);
+        pid_t frontmost_pid = gcf_frontmost_application_pid();
+        if (target_pid <= 0 && !g_config.frontmost_gate) {
+            target_pid = frontmost_pid;
+        }
+        if (target_pid <= 0 || target_pid != frontmost_pid) {
+            debug_log("capture-top-click-no-target type=%u", (unsigned)type);
+            return false;
+        }
+        safe_location = CGPointMake(location.x, top_fence_y() + 1.0);
+    }
+
+    CGEventRef copy = CGEventCreateCopy(event);
+    if (!copy) {
+        return false;
+    }
+    CGEventSetLocation(copy, safe_location);
+    CGEventSetIntegerValueField(copy, kCGEventSourceUserData, CAPTURE_BUTTON_TAG);
+    if (state && state->down_event && !paired_release) {
+        release_captured_button(state);
+    }
+    bool use_tap_route = proxy && target_pid == gcf_frontmost_application_pid();
+    if (use_tap_route) {
+        CGEventTapPostEvent(proxy, copy);
+    } else {
+        /* Never route a paired release into an unrelated foreground app.
+         * Background release remains best-effort PID delivery. */
+        CGEventPostToPid(target_pid, copy);
+    }
+    if (state) {
+        if (state->down_event) {
+            CFRelease(state->down_event);
+        }
+        *state = (CapturedButton){0};
+        if (!is_capture_button_release(type)) {
+            *state = (CapturedButton){.target_pid = target_pid, .location = safe_location,
+                                      .down_event = (CGEventRef)CFRetain(copy)};
+        }
+    }
+    CFRelease(copy);
+    atomic_fetch_add(&g_capture_forward_count, 1);
+    debug_log("capture-top-click-forwarded targetPid=%d old=(%.1f,%.1f) new=(%.1f,%.1f) type=%u route=%s",
+              target_pid, location.x, location.y, safe_location.x, safe_location.y, (unsigned)type,
+              use_tap_route ? "tap" : "pid-release");
+    return true;
+}
+
 static CGEventRef cursor_event_callback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *user_info) {
-    (void)proxy;
     (void)user_info;
 
     if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
+        release_captured_buttons();
         if (g_event_tap && atomic_load(&g_active)) {
             CGEventTapEnable(g_event_tap, true);
             g_event_tap_enabled = true;
@@ -746,6 +863,29 @@ static CGEventRef cursor_event_callback(CGEventTapProxy proxy, CGEventType type,
         return event;
     }
 
+    if (event && CGEventGetIntegerValueField(event, kCGEventSourceUserData) == CAPTURE_BUTTON_TAG) {
+        return event;
+    }
+    if (event) {
+        CapturedButton *state = capture_button_state(type, event);
+        if (state && is_capture_button_release(type)) {
+            if (state->cleanup_release_pending) {
+                pid_t released_pid = state->target_pid;
+                *state = (CapturedButton){0};
+                if (atomic_load(&g_active) && released_pid == gcf_frontmost_application_pid()) {
+                    return NULL;
+                }
+            } else if (state->down_event) {
+                if (atomic_load(&g_active) && system_cursor_is_visible()) {
+                    rehide_visible_cursor();
+                }
+                forward_capture_button_to_game(proxy, event, type, CGEventGetLocation(event));
+                return NULL;
+            }
+        } else if (state) {
+            state->cleanup_release_pending = false;
+        }
+    }
     if (!atomic_load(&g_active) || !event) {
         g_pointer_state.initialized = false;
         return event;
@@ -780,6 +920,11 @@ static CGEventRef cursor_event_callback(CGEventTapProxy proxy, CGEventType type,
          * The main loop samples the actual WindowServer location instead.
          */
         if (is_mouse_button) {
+            pid_t target_pid = atomic_load(&g_capture_target_pid);
+            if (g_config.frontmost_gate &&
+                (target_pid <= 0 || target_pid != gcf_frontmost_application_pid())) {
+                return event;
+            }
             if (system_cursor_is_visible()) {
                 rehide_visible_cursor();
             }
@@ -792,11 +937,8 @@ static CGEventRef cursor_event_callback(CGEventTapProxy proxy, CGEventType type,
         double protected_button_top = top_fence_y() + 0.5;
         if (is_mouse_button &&
             gcf_capture_edge_should_suppress_button(location.y, protected_button_top)) {
-            debug_log("capture-top-click-suppressed loc=(%.1f,%.1f) type=%u protectedTop=%.1f",
-                      location.x,
-                      location.y,
-                      (unsigned)type,
-                      protected_button_top);
+            forward_capture_button_to_game(proxy, event, type, location);
+            /* Delete the unsafe original; the game receives just the safe copy. */
             return NULL;
         }
         if (location.y <= guard) {
@@ -811,7 +953,7 @@ static CGEventRef cursor_event_callback(CGEventTapProxy proxy, CGEventType type,
                 g_last_motion_debug = now;
             }
         }
-        if (should_suppress_capture_park_event(location, delta_x, delta_y, now)) {
+        if (is_mouse_motion && should_suppress_capture_park_event(location, delta_x, delta_y, now)) {
             debug_log("suppress-park-event loc=(%.1f,%.1f) delta=(%lld,%lld) age=%.3f",
                       location.x,
                       location.y,
